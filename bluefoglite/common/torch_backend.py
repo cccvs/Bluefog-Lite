@@ -28,21 +28,6 @@ from bluefoglite.common import const
 from bluefoglite.common.topology import GetRecvWeights
 
 
-def gloo_device_wrapper(func):
-    @functools.wraps(func)
-    def wrapper(
-        *args, **kwargs
-    ):  # args: self; kwargs: tensor, self_weight, src_weights, dst_weights, inplace
-        if args[0]._backend == "gloo":
-            device = kwargs["tensor"].device
-            kwargs["tensor"] = kwargs["tensor"].cpu()
-            return func(*args, **kwargs).to(device)
-        else:
-            return func(*args, **kwargs)
-
-        return wrapper
-
-
 @dataclasses.dataclass
 class TopologyAndWeights:
     topology: nx.DiGraph
@@ -89,6 +74,20 @@ class BlueFogLiteGroup:
         self._size: Optional[int] = None
         self._topology_and_weights: Optional[TopologyAndWeights] = None
         self._process_group: Optional[dist.ProcessGroup] = None
+
+    def gloo_device_wrapper(func):
+        @functools.wraps(func)
+        def wrapper(
+            *args, **kwargs
+        ):  # args: self; kwargs: tensor, self_weight, src_weights, dst_weights, inplace
+            if args[0]._backend == "gloo":
+                device = kwargs["tensor"].device
+                kwargs["tensor"] = kwargs["tensor"].cpu()
+                return func(*args, **kwargs).to(device)
+            else:
+                return func(*args, **kwargs)
+
+        return wrapper
 
     @property
     def process_group(self):
@@ -210,6 +209,8 @@ class BlueFogLiteGroup:
         inplace: bool = False,
     ) -> AsyncWork:
         # TODO 1. add topology check service.
+        if self._backend == "gloo":
+            tensor_cpu = tensor.to("cpu")
         if (
             self_weight is None
             and src_weights is None
@@ -225,12 +226,17 @@ class BlueFogLiteGroup:
                 "Must provide all self_weight, src_weights, and dst_weights "
                 "arguments or set static topology."
             )
-        tmp_recv_tensors = {i: torch.zeros_like(tensor) for i, _ in src_weights.items()}
+        tmp_recv_tensors = {
+            i: torch.zeros_like(tensor_cpu) for i, _ in src_weights.items()
+        }
         op_list = []
         for dst, weight in dst_weights.items():
             op_list.append(
                 dist.P2POp(
-                    dist.isend, tensor.mul(weight), peer=dst, group=self.process_group
+                    dist.isend,
+                    tensor_cpu.mul(weight),
+                    peer=dst,
+                    group=self.process_group,
                 )
             )
         for src, tmp_tensor in tmp_recv_tensors.items():
@@ -241,15 +247,21 @@ class BlueFogLiteGroup:
 
         def post_func(
             tensor: torch.Tensor,
+            tensor_cpu: torch.Tensor,
             tmp_recv_tensors: Dict[int, torch.Tensor],
             self_weight: float,
             src_weights: Dict[int, float],
         ) -> torch.Tensor:
-            tensor_ = tensor if inplace else tensor.detach().clone()
+            if self._backend == "gloo":
+                tensor_ = tensor_cpu.detach().clone()
+            else:
+                tensor_ = tensor if inplace else tensor.detach().clone()
             tensor_.mul_(self_weight)
             for src, weight in src_weights.items():
                 tensor_.add_(tmp_recv_tensors[src].mul_(weight))
-            del tmp_recv_tensors
+            if inplace:
+                tensor.copy_(tensor_)
+            del tmp_recv_tensors, tensor_cpu
             return tensor_
 
         return AsyncWork(
@@ -257,13 +269,14 @@ class BlueFogLiteGroup:
             functools.partial(
                 post_func,
                 tensor=tensor,
+                tensor_cpu=tensor_cpu,
                 tmp_recv_tensors=tmp_recv_tensors,
                 self_weight=self_weight,
                 src_weights=src_weights,
             ),
         )
 
-    @gloo_device_wrapper
+    # @gloo_device_wrapper
     def neighbor_allreduce(
         self,
         tensor: torch.Tensor,
